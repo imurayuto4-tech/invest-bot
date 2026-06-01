@@ -25,10 +25,10 @@ def market_open(t):
         return False
 
 
-def bars(dc, sym, days):
+def all_bars(dc, symbols, days):
     end = datetime.now() - timedelta(days=1)
     start = end - timedelta(days=days)
-    req = StockBarsRequest(symbol_or_symbols=sym, timeframe=TimeFrame.Day,
+    req = StockBarsRequest(symbol_or_symbols=symbols, timeframe=TimeFrame.Day,
                            start=start, end=end, feed=DataFeed.IEX)
     return dc.get_stock_bars(req).df
 
@@ -44,43 +44,60 @@ def dca(t):
             print(f"  {sym}: 失敗 {e}")
 
 
+def rank_universe(dc):
+    md = config.MOMENTUM_DAYS
+    df = all_bars(dc, config.UNIVERSE, 365)
+    scored = []
+    for sym in config.UNIVERSE:
+        try:
+            c = df.loc[sym]["close"].reset_index(drop=True)
+        except Exception:
+            continue
+        if len(c) < 200:
+            continue
+        price = float(c.iloc[-1])
+        sma200 = float(c.tail(200).mean())
+        mom = (price / float(c.iloc[-md]) - 1) * 100
+        if price > sma200 and mom > 0:
+            scored.append((sym, mom, price))
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return scored
+
+
 def trade(t, dc):
     if not market_open(t):
         print("市場は閉まっています。何もしません。")
         return
-    print("=== モメンタム(10%) ===")
+    print("=== モメンタム・スキャン(10%) ===")
     equity = float(t.get_account().equity)
-    per = equity * config.SLEEVE_PCT / max(len(config.SLEEVE_SYMBOLS), 1)
-    pos = {p.symbol: p for p in t.get_all_positions()}
-    bd = config.BREAKOUT_DAYS
-    for sym in config.SLEEVE_SYMBOLS:
-        df = bars(dc, sym, bd + 15)
-        if df.empty or len(df) < bd + 1:
-            print(f"  {sym}: データ不足"); continue
-        c = df["close"].reset_index(drop=True)
-        price = float(c.iloc[-1])
-        prev_high = float(c.iloc[-(bd + 1):-1].max())
-        held = sym in pos
-        if held:
-            gain = float(pos[sym].unrealized_plpc) * 100
-            print(f"  {sym}: 含み{gain:+.1f}% 保有中")
-            if gain >= config.TAKE_PROFIT_PCT or gain <= -config.STOP_LOSS_PCT:
-                why = "利確" if gain > 0 else "損切り"
-                o = MarketOrderRequest(symbol=sym, qty=pos[sym].qty,
-                                       side=OrderSide.SELL, time_in_force=TimeInForce.DAY)
-                try:
-                    t.submit_order(o); print(f"    → {why} 売り {pos[sym].qty}株")
-                except Exception as e:
-                    print(f"    失敗 {e}")
-        else:
-            print(f"  {sym}: ${price:.2f} 直近{bd}日高値${prev_high:.2f} {'(更新!)' if price > prev_high else ''}")
-            if price > prev_high:
-                o = MarketOrderRequest(symbol=sym, notional=round(per, 2),
-                                       side=OrderSide.BUY, time_in_force=TimeInForce.DAY)
-                try:
-                    t.submit_order(o); print(f"    → 買い ${per:.0f}")
-                except Exception as e:
-                    print(f"    失敗 {e}")
+    top_n = config.TOP_N
+    per = equity * config.SLEEVE_PCT / top_n
+    pos = {p.symbol: p for p in t.get_all_positions()
+           if p.symbol not in config.DCA_PLAN}
+    ranked = rank_universe(dc)
+    targets = [s for s, m, p in ranked[:top_n]]
+    print("旬の上位:", ", ".join(f"{s}(+{m:.0f}%)" for s, m, p in ranked[:top_n]) or "該当なし")
+
+    for sym, p in pos.items():
+        gain = float(p.unrealized_plpc) * 100
+        if sym not in targets or gain <= -config.STOP_LOSS_PCT:
+            why = "損切り" if gain <= -config.STOP_LOSS_PCT else "入替売り"
+            o = MarketOrderRequest(symbol=sym, qty=p.qty, side=OrderSide.SELL,
+                                   time_in_force=TimeInForce.DAY)
+            try:
+                t.submit_order(o); print(f"  → {why} {sym} {p.qty}株 ({gain:+.1f}%)")
+            except Exception as e:
+                print(f"  売り失敗 {sym}: {e}")
+
+    held = set(pos.keys())
+    for sym in targets:
+        if sym not in held:
+            o = MarketOrderRequest(symbol=sym, notional=round(per, 2),
+                                   side=OrderSide.BUY, time_in_force=TimeInForce.DAY)
+            try:
+                t.submit_order(o); print(f"  → 買い {sym} ${per:.0f}")
+            except Exception as e:
+                print(f"  買い失敗 {sym}: {e}")
 
 
 def status(t):

@@ -1,0 +1,13 @@
+import os
+
+API_KEY = os.environ.get("ALPACA_API_KEY", "")
+SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY", "")
+PAPER = True
+
+DCA_PLAN = {"VOO": 450, "VTI": 450}
+
+SLEEVE_PCT = 0.10
+SLEEVE_SYMBOLS = ["SPY", "QQQ", "DIA"]
+BREAKOUT_DAYS = 20
+TAKE_PROFIT_PCT = 10.0
+STOP_LOSS_PCT = 5.0

@@ -1,0 +1,27 @@
+name: invest-bot
+on:
+  schedule:
+    - cron: '*/15 13-21 * * 1-5'
+    - cron: '0 14 * * 1'
+  workflow_dispatch:
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install alpaca-py pandas
+      - name: dca-monday
+        if: github.event.schedule == '0 14 * * 1'
+        env:
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+        run: python invest.py dca
+      - name: trade
+        if: github.event.schedule != '0 14 * * 1'
+        env:
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+        run: python invest.py trade

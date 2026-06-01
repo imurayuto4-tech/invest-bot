@@ -9,6 +9,8 @@ from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.data.enums import DataFeed
 
+RESERVE = 0.05  # 常に資産の5%は現金で残す(借金しない)
+
 
 def clients():
     if not config.API_KEY or not config.SECRET_KEY:
@@ -34,23 +36,21 @@ def all_bars(dc, symbols, days):
 
 
 def core(t):
-    print("=== インデックス・コア(目標90%まで) ===")
+    print("=== インデックス・コア ===")
     acct = t.get_account()
     equity = float(acct.equity)
     cash = float(acct.cash)
-    target = equity * (1 - config.SLEEVE_PCT)
+    target = equity * (1 - config.SLEEVE_PCT - RESERVE)
     pos = {p.symbol: float(p.market_value) for p in t.get_all_positions()}
     core_val = sum(pos.get(s, 0.0) for s in config.CORE_SYMBOLS)
     deficit = target - core_val
+    spendable = max(0.0, cash - equity * RESERVE)
+    spend = min(deficit, spendable)
     print(f"  指数 現在${core_val:,.0f} / 目標${target:,.0f} / 現金${cash:,.0f}")
-    if deficit < 50:
-        print("  目標達成済み。買い増しなし。")
+    if spend < 1:
+        print("  買い増しなし(目標達成か現金不足)。")
         return
-    spend = min(deficit, cash * 0.95)
     per = spend / len(config.CORE_SYMBOLS)
-    if per < 1:
-        print("  現金が不足。今回は見送り。")
-        return
     for s in config.CORE_SYMBOLS:
         o = MarketOrderRequest(symbol=s, notional=round(per, 2),
                                side=OrderSide.BUY, time_in_force=TimeInForce.DAY)
@@ -82,7 +82,9 @@ def rank_universe(dc):
 
 def momentum(t, dc):
     print("=== モメンタム・スキャン(10%) ===")
-    equity = float(t.get_account().equity)
+    acct = t.get_account()
+    equity = float(acct.equity)
+    cash_left = float(acct.cash) - equity * RESERVE
     top_n = config.TOP_N
     per = equity * config.SLEEVE_PCT / top_n
     pos = {p.symbol: p for p in t.get_all_positions()
@@ -98,15 +100,19 @@ def momentum(t, dc):
                                    time_in_force=TimeInForce.DAY)
             try:
                 t.submit_order(o); print(f"  → {why} {sym} {p.qty}株 ({gain:+.1f}%)")
+                cash_left += float(p.market_value)
             except Exception as e:
                 print(f"  売り失敗 {sym}: {e}")
     held = set(pos.keys())
     for sym in targets:
         if sym not in held:
+            if cash_left < per:
+                print(f"  {sym}: 現金不足のため見送り")
+                continue
             o = MarketOrderRequest(symbol=sym, notional=round(per, 2),
                                    side=OrderSide.BUY, time_in_force=TimeInForce.DAY)
             try:
-                t.submit_order(o); print(f"  → 買い {sym} ${per:.0f}")
+                t.submit_order(o); print(f"  → 買い {sym} ${per:.0f}"); cash_left -= per
             except Exception as e:
                 print(f"  買い失敗 {sym}: {e}")
 

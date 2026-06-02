@@ -9,7 +9,7 @@ from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.data.enums import DataFeed
 
-RESERVE = 0.05  # 常に資産の5%は現金で残す(借金しない)
+RESERVE = 0.01  # 約1%だけ余白(借金=レバレッジを絶対にしないため)
 
 
 def clients():
@@ -81,7 +81,7 @@ def rank_universe(dc):
 
 
 def momentum(t, dc):
-    print("=== モメンタム・スキャン(10%) ===")
+    print("=== モメンタム・スキャン ===")
     acct = t.get_account()
     equity = float(acct.equity)
     cash_left = float(acct.cash) - equity * RESERVE

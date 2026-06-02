@@ -1,0 +1,20 @@
+name: backtest
+on:
+  workflow_dispatch:
+    inputs:
+      start:
+        description: '開始日 (例 2018-01-01)'
+        default: '2018-01-01'
+      rebal:
+        description: 'サヤ枠の入替間隔(営業日) 5=週次 21=月次'
+        default: '21'
+jobs:
+  bt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install yfinance pandas numpy
+      - run: python backtest.py --start "${{ github.event.inputs.start }}" --rebal "${{ github.event.inputs.rebal }}"

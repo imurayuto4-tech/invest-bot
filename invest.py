@@ -2,8 +2,9 @@ import sys
 from datetime import datetime, timedelta
 import config
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest
-from alpaca.trading.enums import OrderSide, TimeInForce
+from alpaca.trading.requests import (MarketOrderRequest, StopOrderRequest,
+                                      GetOrdersRequest)
+from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
@@ -33,6 +34,16 @@ def all_bars(dc, symbols, days):
     req = StockBarsRequest(symbol_or_symbols=symbols, timeframe=TimeFrame.Day,
                            start=start, end=end, feed=DataFeed.IEX)
     return dc.get_stock_bars(req).df
+
+
+def cancel_stops(t, sym):
+    """板に残っている sym の売りストップ注文を取り消す(#4。入替/損切り前に呼ぶ)。"""
+    try:
+        for od in t.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN)):
+            if od.symbol == sym and "sell" in str(od.side).lower():
+                t.cancel_order_by_id(od.id)
+    except Exception as e:
+        print(f"  ストップ取消失敗 {sym}: {e}")
 
 
 # ===================== #8 暴落避難(リジーム判定) =====================
@@ -76,7 +87,6 @@ def core(t, risk_on):
         unwanted = list(config.CORE_SYMBOLS)
         print(f"  リジーム: ★退避★ コアを {safe} に避難")
 
-    # 不要側(退避先 or 旧コア)を売却して資金化
     for s in unwanted:
         if s in pos and float(pos[s].market_value) > 1:
             o = MarketOrderRequest(symbol=s, qty=pos[s].qty,
@@ -105,7 +115,7 @@ def core(t, risk_on):
             print(f"  {s}: 失敗 {e}")
 
 
-# ===================== 能動枠(#6 逆ボラ配分) =====================
+# ===================== 能動枠(#6 逆ボラ配分 + #4 ストップ注文) =====================
 def rank_universe(dc):
     md = config.MOMENTUM_DAYS
     vd = getattr(config, "VOL_DAYS", 20)
@@ -147,27 +157,33 @@ def sleeve_weights(top):
 
 def momentum(t, dc):
     print("=== モメンタム・スキャン ===")
+    safe = getattr(config, "SAFE_SYMBOL", "SGOV")
+    use_stops = getattr(config, "USE_STOP_ORDERS", False)
     acct = t.get_account()
     equity = float(acct.equity)
     cash_left = float(acct.cash) - equity * RESERVE
     top_n = config.TOP_N
     pos = {p.symbol: p for p in t.get_all_positions()
-           if p.symbol not in config.CORE_SYMBOLS
-           and p.symbol != getattr(config, "SAFE_SYMBOL", "SGOV")}
+           if p.symbol not in config.CORE_SYMBOLS and p.symbol != safe}
     ranked = rank_universe(dc)
     top = ranked[:top_n]
     targets = [s for s, m, p, v in top]
+    prices = {s: p for s, m, p, v in top}
     weights = sleeve_weights(top)
     sleeve_budget = equity * config.SLEEVE_PCT
     target_notional = {s: sleeve_budget * weights[s] for s in targets}
-    print(f"  重み付け: {getattr(config, 'WEIGHTING', 'equal')}")
+    print(f"  重み付け: {getattr(config, 'WEIGHTING', 'equal')} / ストップ注文: {use_stops}")
     print("  旬の上位:", ", ".join(f"{s}(+{m:.0f}%)" for s, m, p, v in top) or "該当なし")
     if targets:
         print("  配分目標:", ", ".join(f"{s} ${target_notional[s]:,.0f}" for s in targets))
+
+    # 入替/損切り(#4: 板のストップを取り消してから売る)
     for sym, p in pos.items():
         gain = float(p.unrealized_plpc) * 100
         if sym not in targets or gain <= -config.STOP_LOSS_PCT:
             why = "損切り" if gain <= -config.STOP_LOSS_PCT else "入替売り"
+            if use_stops:
+                cancel_stops(t, sym)
             o = MarketOrderRequest(symbol=sym, qty=p.qty, side=OrderSide.SELL,
                                    time_in_force=TimeInForce.DAY)
             try:
@@ -175,19 +191,44 @@ def momentum(t, dc):
                 cash_left += float(p.market_value)
             except Exception as e:
                 print(f"  売り失敗 {sym}: {e}")
+
+    # 新規買い
     held = set(pos.keys())
     for sym in targets:
-        if sym not in held:
-            notional = target_notional[sym]
-            if notional < 1:
+        if sym in held:
+            continue
+        notional = target_notional[sym]
+        if notional < 1:
+            continue
+        if use_stops:
+            # #4: 整数株で買い、建値-STOP%にGTCストップを板へ
+            price = prices[sym]
+            qty = int(notional // price)
+            if qty < 1:
+                print(f"  {sym}: 1株に満たず見送り(目標${notional:,.0f} < 株価${price:,.0f})")
                 continue
+            cost = qty * price
+            if cash_left < cost:
+                print(f"  {sym}: 現金不足のため見送り")
+                continue
+            try:
+                t.submit_order(MarketOrderRequest(symbol=sym, qty=qty, side=OrderSide.BUY,
+                                                  time_in_force=TimeInForce.DAY))
+                stop_px = round(price * (1 - config.STOP_LOSS_PCT / 100.0), 2)
+                t.submit_order(StopOrderRequest(symbol=sym, qty=qty, side=OrderSide.SELL,
+                                                time_in_force=TimeInForce.GTC, stop_price=stop_px))
+                print(f"  → 買い {sym} {qty}株 (${cost:,.0f}) + ストップ ${stop_px}")
+                cash_left -= cost
+            except Exception as e:
+                print(f"  買い失敗 {sym}: {e}")
+        else:
             if cash_left < notional:
                 print(f"  {sym}: 現金不足のため見送り")
                 continue
-            o = MarketOrderRequest(symbol=sym, notional=round(notional, 2),
-                                   side=OrderSide.BUY, time_in_force=TimeInForce.DAY)
             try:
-                t.submit_order(o); print(f"  → 買い {sym} ${notional:,.0f}"); cash_left -= notional
+                t.submit_order(MarketOrderRequest(symbol=sym, notional=round(notional, 2),
+                                                  side=OrderSide.BUY, time_in_force=TimeInForce.DAY))
+                print(f"  → 買い {sym} ${notional:,.0f}"); cash_left -= notional
             except Exception as e:
                 print(f"  買い失敗 {sym}: {e}")
 
@@ -198,8 +239,7 @@ def run(t, dc):
         return
     safe = getattr(config, "SAFE_SYMBOL", "SGOV")
     held = {p.symbol for p in t.get_all_positions()}
-    hedged_now = safe in held
-    risk_on = market_risk_on(dc, hedged_now)
+    risk_on = market_risk_on(dc, safe in held)
     core(t, risk_on)
     momentum(t, dc)
 
@@ -211,14 +251,32 @@ def status(t):
         print(f"  {p.symbol:5s} {p.qty}株 {float(p.unrealized_plpc)*100:+.1f}%")
 
 
+def log_history(t):
+    """#10: 評価額・現金・保有を history.csv に追記(成績記録 + 60日自動停止の防止)。"""
+    import csv, os, datetime
+    a = t.get_account()
+    positions = ";".join(f"{p.symbol}:{p.qty}" for p in t.get_all_positions())
+    path = "history.csv"
+    new = not os.path.exists(path)
+    with open(path, "a", newline="") as f:
+        w = csv.writer(f)
+        if new:
+            w.writerow(["date", "equity", "cash", "positions"])
+        w.writerow([datetime.date.today().isoformat(),
+                    f"{float(a.equity):.2f}", f"{float(a.cash):.2f}", positions])
+    print(f"記録: equity ${float(a.equity):,.2f} / 保有 {positions}")
+
+
 def main():
     cmd = sys.argv[1] if len(sys.argv) > 1 else "help"
     if cmd in ("trade", "dca", "run"):
         t, dc = clients(); run(t, dc)
     elif cmd == "status":
         t, _ = clients(); status(t)
+    elif cmd == "log":
+        t, _ = clients(); log_history(t)
     else:
-        print("使い方: python invest.py [run | status]")
+        print("使い方: python invest.py [run | status | log]")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,32 @@
+name: log
+# #10: 平日引け後に評価額・保有を history.csv へ記録して commit。
+#  - 成績がGitHub上で「自動更新される表」として残る
+#  - 毎日commitが入るので60日放置の自動停止も防げる
+#  - 実行失敗時はGitHubから自動でメール通知(標準機能)
+on:
+  schedule:
+    - cron: '15 21 * * 1-5'   # 平日 21:15 UTC ≒ 米株引け後
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  log:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install alpaca-py pandas
+      - name: record
+        env:
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+        run: python invest.py log
+      - name: commit
+        run: |
+          git config user.name "invest-bot"
+          git config user.email "invest-bot@users.noreply.github.com"
+          git add history.csv
+          git commit -m "log $(date -u +%F)" || echo "変更なし"
+          git push

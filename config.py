@@ -14,17 +14,18 @@ MOMENTUM_DAYS = 60
 STOP_LOSS_PCT = 8.0
 
 # --- #6 リスク配分(逆ボラティリティ) ---
-# "equal"=等金額 / "invvol"=穏やかな株を多め・激しい株を少なめ
-WEIGHTING = "invvol"
+WEIGHTING = "invvol"      # "equal"=等金額 / "invvol"=穏やかな株を多め
 VOL_DAYS = 20
 
 # --- #8 暴落避難(リジーム・フィルター) ---
-# 市場全体(SPY)が200日線を割ったら、コアを短期国債ETF(SGOV)に退避。回復で戻す。
 CRASH_HEDGE = True
-REGIME_SYMBOL = "SPY"     # 市場全体の代理(S&P500連動)
-REGIME_SMA = 200          # 判定に使う移動平均(日数)
-REGIME_BAND = 0.02        # 200日線×(1-0.02)割れで退避 / 線を上抜けで復帰(だまし対策)
+REGIME_SYMBOL = "SPY"
+REGIME_SMA = 200
+REGIME_BAND = 0.02        # 200日線×(1-0.02)割れで退避 / 上抜けで復帰
 SAFE_SYMBOL = "SGOV"      # 退避先:超短期米国債ETF
+
+# --- #4 本物の損切り注文 ---
+USE_STOP_ORDERS = True    # True=整数株で買い建値-8%にGTCストップを板へ / False=従来の見回り式
 
 UNIVERSE = [
     "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA", "AMD",

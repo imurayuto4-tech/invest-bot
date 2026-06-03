@@ -43,10 +43,9 @@ def load_prices(tickers, start, end):
     import yfinance as yf
     raw = yf.download(tickers, start=start, end=end, auto_adjust=True, progress=False, group_by="column")
     px = raw["Close"].copy() if isinstance(raw.columns, pd.MultiIndex) else raw[["Close"]]
-    px = px.dropna(how="all").ffill()
-    if BENCH in px:
-        px = px.loc[px[BENCH].notna()]
-    return px
+    if BENCH in px.columns:
+        px = px[px[BENCH].notna()]      # ★ffillの前に株の営業日だけへ(cryptoの週末を落とす)
+    return px.ffill()
 
 
 def synth_prices(tickers, start, end, seed=7):

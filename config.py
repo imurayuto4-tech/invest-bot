@@ -11,21 +11,26 @@ CORE_SYMBOLS = ["VOO", "VTI"]
 SLEEVE_PCT = 0.15
 TOP_N = 5
 MOMENTUM_DAYS = 60
-STOP_LOSS_PCT = 8.0
+STOP_LOSS_PCT = 8.0       # STOP_MODE="fixed" のときの一律損切り幅 / atrの保険値
 
 # --- #6 リスク配分(逆ボラティリティ) ---
-WEIGHTING = "invvol"      # "equal"=等金額 / "invvol"=穏やかな株を多め
+WEIGHTING = "invvol"
 VOL_DAYS = 20
 
 # --- #8 暴落避難(リジーム・フィルター) ---
 CRASH_HEDGE = True
 REGIME_SYMBOL = "SPY"
 REGIME_SMA = 200
-REGIME_BAND = 0.02        # 200日線×(1-0.02)割れで退避 / 上抜けで復帰
-SAFE_SYMBOL = "SGOV"      # 退避先:超短期米国債ETF
+REGIME_BAND = 0.02
+SAFE_SYMBOL = "SGOV"
 
 # --- #4 本物の損切り注文 ---
-USE_STOP_ORDERS = True    # True=整数株で買い建値-8%にGTCストップを板へ / False=従来の見回り式
+USE_STOP_ORDERS = True
+# 損切り幅: "fixed"=一律 STOP_LOSS_PCT% / "atr"=ボラ連動(STOP_K×日次ボラ%, MIN〜MAXで挟む)
+STOP_MODE = "atr"
+STOP_K = 4.0
+STOP_MIN_PCT = 5.0
+STOP_MAX_PCT = 18.0
 
 UNIVERSE = [
     "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA", "AMD",

@@ -1,10 +1,14 @@
 """
-backtest.py — 最近データで戦略を検証。比較:
-  (1) 指数のみ VOO / (2) 等金額・退避なし / (3) 逆ボラ#6・退避なし
-  (4) #6+#8 + 固定8%ストップ / (5) #6+#8 + ボラ連動ストップ ← ライブ設定
+backtest.py — 最近データ(既定 2018-01-01〜今日)で戦略を検証。
+比較:
+  (1) 指数のみ VOO
+  (2) 現行       : 逆ボラ#6 + #8退避 + ボラ連動ストップ(rank入替・株のみ)
+  (3) 勝ち伸ばし : 上をトレーリングストップ&崩れるまで保有(株のみ)
+  (4) +crypto    : 勝ち伸ばし に BTC/ETH を同ルールで追加
 使い方: pip install yfinance pandas numpy ; python backtest.py --start 2018-01-01
-        python backtest.py --selftest (ネット不要・エンジン確認)
-注意: 手数料0・スリッページ無視・配当調整済み終値の近似。退避先はBILで代用(ライブはSGOV)。
+        python backtest.py --selftest   (ネット不要・エンジン確認)
+注意: 手数料0・スリッページ無視・配当調整済み終値の近似。退避先BIL(ライブはSGOV)。
+      cryptoは日足を株の営業日に合わせてサンプリング(週末の値動きは粗く扱う近似)。
 """
 import argparse
 import numpy as np
@@ -25,6 +29,7 @@ except Exception:
     REGIME_SMA, REGIME_BAND, STOP_K, STOP_MIN_PCT, STOP_MAX_PCT = 200, 0.02, 4.0, 5.0, 18.0
     UNIVERSE = ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA", "AMD"]
 
+CRYPTO = ["BTC-USD", "ETH-USD"]
 RESERVE = 0.01; SMA_DAYS = 200; REGIME_SYM = "SPY"; SAFE = "BIL"; BENCH = "VOO"; START_EQUITY = 100_000.0
 
 
@@ -38,7 +43,10 @@ def load_prices(tickers, start, end):
     import yfinance as yf
     raw = yf.download(tickers, start=start, end=end, auto_adjust=True, progress=False, group_by="column")
     px = raw["Close"].copy() if isinstance(raw.columns, pd.MultiIndex) else raw[["Close"]]
-    return px.dropna(how="all").ffill()
+    px = px.dropna(how="all").ffill()
+    if BENCH in px:
+        px = px.loc[px[BENCH].notna()]
+    return px
 
 
 def synth_prices(tickers, start, end, seed=7):
@@ -46,17 +54,20 @@ def synth_prices(tickers, start, end, seed=7):
     for t in tickers:
         if t == SAFE: mu, sig = 0.02 / 252, 0.0007
         elif t == REGIME_SYM: mu, sig = 0.0003, 0.012
+        elif t in CRYPTO: mu, sig = rng.uniform(0.0, 0.0012), rng.uniform(0.04, 0.06)
         else: mu, sig = rng.uniform(-0.0002, 0.0008), rng.uniform(0.01, 0.035)
         out[t] = 100.0 * np.exp(np.cumsum(rng.normal(mu, sig, len(idx))))
     return pd.DataFrame(out, index=idx)
 
 
-def run_strategy(px, IND, weighting, hedge, rebal=21, stop_mode="fixed"):
+def run_strategy(px, IND, weighting, hedge, rebal=21, stop_mode="fixed",
+                 sleeve_style="rotate", use_crypto=False):
     cols = list(px.columns); ci = {s: k for k, s in enumerate(cols)}; P = px.values
     SMA, MOM, VOL = IND["sma"], IND["mom"], IND["vol"]; rsma = IND["rsma"]
-    uni_idx = [ci[s] for s in UNIVERSE if s in ci]
+    uni = list(UNIVERSE) + (CRYPTO if use_crypto else [])
+    uni_idx = [ci[s] for s in uni if s in ci]
     core_idx = [ci[s] for s in CORE if s in ci]; safe_idx = ci.get(SAFE); T = len(px)
-    cash = START_EQUITY; core_sh = {}; sleeve_sh, entry, estop = {}, {}, {}; hedged = False
+    cash = START_EQUITY; core_sh = {}; sleeve_sh, entry, estop, hi = {}, {}, {}, {}; hedged = False
     curve = np.empty(T)
 
     def val(book, i):
@@ -67,6 +78,10 @@ def run_strategy(px, IND, weighting, hedge, rebal=21, stop_mode="fixed"):
         return s
 
     def equity(i): return cash + val(core_sh, i) + val(sleeve_sh, i)
+
+    def drop(c):
+        for d in (sleeve_sh, entry, estop, hi):
+            d.pop(c, None)
 
     def set_core(targets, i):
         nonlocal cash
@@ -84,8 +99,12 @@ def run_strategy(px, IND, weighting, hedge, rebal=21, stop_mode="fixed"):
     for i in range(T):
         for c in list(sleeve_sh):
             v = P[i, c]
-            if v == v and v <= entry[c] * (1 - estop[c] / 100.0):
-                cash += sleeve_sh[c] * v; del sleeve_sh[c]; del entry[c]; del estop[c]
+            if v != v: continue
+            if v > hi[c]: hi[c] = v
+            ref = hi[c] if sleeve_style == "trail" else entry[c]
+            if v <= ref * (1 - estop[c] / 100.0):
+                cash += sleeve_sh[c] * v; drop(c)
+
         if hedge and i >= REGIME_SMA:
             price, m = P[i, ci[REGIME_SYM]], rsma[i]
             if m == m:
@@ -94,6 +113,7 @@ def run_strategy(px, IND, weighting, hedge, rebal=21, stop_mode="fixed"):
                 elif hedged and price > m: nh = False
                 if nh != hedged:
                     hedged = nh; set_core([safe_idx] if hedged else core_idx, i)
+
         if i >= SMA_DAYS and (i - SMA_DAYS) % rebal == 0:
             set_core([safe_idx] if hedged else core_idx, i)
             cand = []
@@ -101,25 +121,50 @@ def run_strategy(px, IND, weighting, hedge, rebal=21, stop_mode="fixed"):
                 price, sma, mom, vol = P[i, c], SMA[i, c], MOM[i, c], VOL[i, c]
                 if sma == sma and mom == mom and price > sma and mom > 0:
                     cand.append((c, mom, vol if (vol == vol and vol > 0) else 1e-6))
-            cand.sort(key=lambda x: x[1], reverse=True); top = cand[:TOP_N]
-            if top:
-                if weighting == "invvol":
-                    inv = {c: 1.0 / v for c, m, v in top}; tot = sum(inv.values())
-                    w = {c: inv[c] / tot for c, m, v in top}
-                else:
-                    w = {c: 1.0 / len(top) for c, m, v in top}
+            cand.sort(key=lambda x: x[1], reverse=True)
+
+            if sleeve_style == "trail":
+                cset = {c for c, m, v in cand}
+                for c in list(sleeve_sh):
+                    if c not in cset:
+                        cash += sleeve_sh[c] * P[i, c]; drop(c)
+                slots = TOP_N - len(sleeve_sh)
+                if slots > 0:
+                    new = [(c, m, v) for c, m, v in cand if c not in sleeve_sh][:slots]
+                    budget = max(0.0, equity(i) * SLEEVE_PCT - val(sleeve_sh, i))
+                    if new and budget > 0:
+                        if weighting == "invvol":
+                            inv = {c: 1.0 / v for c, m, v in new}; tot = sum(inv.values())
+                            w = {c: inv[c] / tot for c, m, v in new}
+                        else:
+                            w = {c: 1.0 / len(new) for c, m, v in new}
+                        for c, wt in w.items():
+                            pr = P[i, c]
+                            if pr != pr: continue
+                            sh = budget * wt / pr
+                            cash -= sh * pr; sleeve_sh[c] = sh
+                            entry[c] = pr; hi[c] = pr; estop[c] = bt_stop_pct(VOL[i, c], stop_mode)
             else:
-                w = {}
-            for c in list(sleeve_sh):
-                if c not in w:
-                    cash += sleeve_sh[c] * P[i, c]; del sleeve_sh[c]; del entry[c]; del estop[c]
-            budget = equity(i) * SLEEVE_PCT
-            for c, wt in w.items():
-                pr = P[i, c]
-                if pr != pr: continue
-                tgt = budget * wt / pr; cash -= (tgt - sleeve_sh.get(c, 0.0)) * pr; sleeve_sh[c] = tgt
-                if c not in entry:
-                    entry[c] = pr; estop[c] = bt_stop_pct(VOL[i, c], stop_mode)
+                top = cand[:TOP_N]
+                if top:
+                    if weighting == "invvol":
+                        inv = {c: 1.0 / v for c, m, v in top}; tot = sum(inv.values())
+                        w = {c: inv[c] / tot for c, m, v in top}
+                    else:
+                        w = {c: 1.0 / len(top) for c, m, v in top}
+                else:
+                    w = {}
+                for c in list(sleeve_sh):
+                    if c not in w:
+                        cash += sleeve_sh[c] * P[i, c]; drop(c)
+                budget = equity(i) * SLEEVE_PCT
+                for c, wt in w.items():
+                    pr = P[i, c]
+                    if pr != pr: continue
+                    tgt = budget * wt / pr; cash -= (tgt - sleeve_sh.get(c, 0.0)) * pr; sleeve_sh[c] = tgt
+                    if c not in entry:
+                        entry[c] = pr; hi[c] = pr; estop[c] = bt_stop_pct(VOL[i, c], stop_mode)
+
         curve[i] = equity(i)
     return pd.Series(curve, index=px.index).iloc[SMA_DAYS:]
 
@@ -153,7 +198,7 @@ def main():
     ap.add_argument("--start", default="2018-01-01"); ap.add_argument("--end", default=None)
     ap.add_argument("--rebal", type=int, default=21); ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args()
-    tickers = sorted(set(UNIVERSE + CORE + [BENCH, REGIME_SYM, SAFE]))
+    tickers = sorted(set(UNIVERSE + CRYPTO + CORE + [BENCH, REGIME_SYM, SAFE]))
     end = a.end or pd.Timestamp.today().strftime("%Y-%m-%d")
     if a.selftest:
         print("[selftest] 合成データでエンジン検証(数値に意味なし)…")
@@ -165,10 +210,9 @@ def main():
     IND = indicators(px)
     results = {
         "(1) 指数のみ VOO": benchmark(px),
-        "(2) 等金額・退避なし": run_strategy(px, IND, "equal", False, a.rebal, "fixed"),
-        "(3) 逆ボラ#6・退避なし": run_strategy(px, IND, "invvol", False, a.rebal, "fixed"),
-        "(4) #6+#8 + 固定8%": run_strategy(px, IND, "invvol", True, a.rebal, "fixed"),
-        "(5) #6+#8 + ボラ連動": run_strategy(px, IND, "invvol", True, a.rebal, "atr"),
+        "(2) 現行(入替・株のみ)": run_strategy(px, IND, "invvol", True, a.rebal, "atr", "rotate", False),
+        "(3) 勝ち伸ばし(株のみ)": run_strategy(px, IND, "invvol", True, a.rebal, "atr", "trail", False),
+        "(4) 勝ち伸ばし+crypto": run_strategy(px, IND, "invvol", True, a.rebal, "atr", "trail", True),
     }
     print("\n================= 結果 =================")
     print("%-24s %12s %8s %9s %8s %8s" % ("戦略", "最終額", "CAGR", "年率ボラ", "Sharpe", "最大DD"))

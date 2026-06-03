@@ -36,6 +36,16 @@ def all_bars(dc, symbols, days):
     return dc.get_stock_bars(req).df
 
 
+def stop_pct(vol_daily):
+    """損切り幅(%)。fixed=一律 STOP_LOSS_PCT / atr=ボラ連動(下限・上限でクランプ)。"""
+    if getattr(config, "STOP_MODE", "fixed") == "atr" and vol_daily and vol_daily > 0:
+        p = getattr(config, "STOP_K", 4.0) * float(vol_daily) * 100.0
+        lo = getattr(config, "STOP_MIN_PCT", 5.0)
+        hi = getattr(config, "STOP_MAX_PCT", 18.0)
+        return min(max(p, lo), hi)
+    return config.STOP_LOSS_PCT
+
+
 def cancel_stops(t, sym):
     """板に残っている sym の売りストップ注文を取り消す(#4。入替/損切り前に呼ぶ)。"""
     try:
@@ -48,8 +58,6 @@ def cancel_stops(t, sym):
 
 # ===================== #8 暴落避難(リジーム判定) =====================
 def market_risk_on(dc, hedged_now):
-    """市場(SPY)が200日線の上ならTrue=通常運用。割れたらFalse=退避。
-    hedged_now=現在SGOVに退避中か。ヒステリシス(だまし対策)に使う。"""
     if not getattr(config, "CRASH_HEDGE", False):
         return True
     sym = getattr(config, "REGIME_SYMBOL", "SPY")
@@ -115,7 +123,7 @@ def core(t, risk_on):
             print(f"  {s}: 失敗 {e}")
 
 
-# ===================== 能動枠(#6 逆ボラ配分 + #4 ストップ注文) =====================
+# ===================== 能動枠(#6 逆ボラ + #4 ストップ/ボラ連動幅) =====================
 def rank_universe(dc):
     md = config.MOMENTUM_DAYS
     vd = getattr(config, "VOL_DAYS", 20)
@@ -166,28 +174,32 @@ def momentum(t, dc):
     pos = {p.symbol: p for p in t.get_all_positions()
            if p.symbol not in config.CORE_SYMBOLS and p.symbol != safe}
     ranked = rank_universe(dc)
+    vol_map = {s: v for s, m, p, v in ranked}
     top = ranked[:top_n]
     targets = [s for s, m, p, v in top]
     prices = {s: p for s, m, p, v in top}
+    top_vol = {s: v for s, m, p, v in top}
     weights = sleeve_weights(top)
     sleeve_budget = equity * config.SLEEVE_PCT
     target_notional = {s: sleeve_budget * weights[s] for s in targets}
-    print(f"  重み付け: {getattr(config, 'WEIGHTING', 'equal')} / ストップ注文: {use_stops}")
+    print(f"  重み付け: {getattr(config, 'WEIGHTING', 'equal')} / ストップ: "
+          f"{getattr(config, 'STOP_MODE', 'fixed')} / 注文化: {use_stops}")
     print("  旬の上位:", ", ".join(f"{s}(+{m:.0f}%)" for s, m, p, v in top) or "該当なし")
     if targets:
         print("  配分目標:", ", ".join(f"{s} ${target_notional[s]:,.0f}" for s in targets))
 
-    # 入替/損切り(#4: 板のストップを取り消してから売る)
+    # 入替/損切り(#4: 板のストップを取り消してから売る。閾値はボラ連動)
     for sym, p in pos.items():
         gain = float(p.unrealized_plpc) * 100
-        if sym not in targets or gain <= -config.STOP_LOSS_PCT:
-            why = "損切り" if gain <= -config.STOP_LOSS_PCT else "入替売り"
+        thr = stop_pct(vol_map[sym]) if sym in vol_map else config.STOP_LOSS_PCT
+        if sym not in targets or gain <= -thr:
+            why = "損切り" if gain <= -thr else "入替売り"
             if use_stops:
                 cancel_stops(t, sym)
             o = MarketOrderRequest(symbol=sym, qty=p.qty, side=OrderSide.SELL,
                                    time_in_force=TimeInForce.DAY)
             try:
-                t.submit_order(o); print(f"  → {why} {sym} {p.qty}株 ({gain:+.1f}%)")
+                t.submit_order(o); print(f"  → {why} {sym} {p.qty}株 ({gain:+.1f}%, 損切り{thr:.0f}%)")
                 cash_left += float(p.market_value)
             except Exception as e:
                 print(f"  売り失敗 {sym}: {e}")
@@ -200,8 +212,9 @@ def momentum(t, dc):
         notional = target_notional[sym]
         if notional < 1:
             continue
+        sp = stop_pct(top_vol[sym])
         if use_stops:
-            # #4: 整数株で買い、建値-STOP%にGTCストップを板へ
+            # #4: 整数株で買い、建値-損切り幅(ボラ連動)にGTCストップを板へ
             price = prices[sym]
             qty = int(notional // price)
             if qty < 1:
@@ -214,10 +227,10 @@ def momentum(t, dc):
             try:
                 t.submit_order(MarketOrderRequest(symbol=sym, qty=qty, side=OrderSide.BUY,
                                                   time_in_force=TimeInForce.DAY))
-                stop_px = round(price * (1 - config.STOP_LOSS_PCT / 100.0), 2)
+                stop_px = round(price * (1 - sp / 100.0), 2)
                 t.submit_order(StopOrderRequest(symbol=sym, qty=qty, side=OrderSide.SELL,
                                                 time_in_force=TimeInForce.GTC, stop_price=stop_px))
-                print(f"  → 買い {sym} {qty}株 (${cost:,.0f}) + ストップ ${stop_px}")
+                print(f"  → 買い {sym} {qty}株 (${cost:,.0f}) + ストップ ${stop_px} (-{sp:.0f}%)")
                 cash_left -= cost
             except Exception as e:
                 print(f"  買い失敗 {sym}: {e}")

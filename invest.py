@@ -2,7 +2,7 @@ import sys
 from datetime import datetime, timedelta
 import config
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import (MarketOrderRequest, StopOrderRequest,
+from alpaca.trading.requests import (MarketOrderRequest, TrailingStopOrderRequest,
                                       GetOrdersRequest)
 from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
 from alpaca.data.historical import StockHistoricalDataClient
@@ -46,14 +46,15 @@ def stop_pct(vol_daily):
     return config.STOP_LOSS_PCT
 
 
-def cancel_stops(t, sym):
-    """板に残っている sym の売りストップ注文を取り消す(#4。入替/損切り前に呼ぶ)。"""
+def cancel_open_orders(t, sym):
+    """sym に紐づく未約定注文(トレーリングストップ等)を全部取り消す。
+    ポジションを手仕舞う/入れ替える前に呼ぶ(売り・買いどちらの保護注文も対象)。"""
     try:
         for od in t.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN)):
-            if od.symbol == sym and "sell" in str(od.side).lower():
+            if od.symbol == sym:
                 t.cancel_order_by_id(od.id)
     except Exception as e:
-        print(f"  ストップ取消失敗 {sym}: {e}")
+        print(f"  注文取消失敗 {sym}: {e}")
 
 
 # ===================== #8 暴落避難(リジーム判定) =====================
@@ -76,55 +77,39 @@ def market_risk_on(dc, hedged_now):
     return price >= sma * (1 - band)      # 退避は線-band%を割れたら
 
 
-# ===================== 退避(#8: 下落局面は現金/SGOVへ) =====================
-def exit_safe(t, safe):
-    """退避解除: 保有しているSGOVを売って、モメンタム買いの現金を作る。"""
-    for p in t.get_all_positions():
-        if p.symbol == safe and float(p.market_value) > 1:
-            o = MarketOrderRequest(symbol=safe, qty=p.qty,
-                                   side=OrderSide.SELL, time_in_force=TimeInForce.DAY)
-            try:
-                t.submit_order(o); print(f"  退避解除: {safe} {p.qty}株 売却")
-            except Exception as e:
-                print(f"  {safe} 売り失敗: {e}")
-
-
-def retreat(t, safe):
-    """★退避★ モメンタム保有を全部売って現金(SGOV)へ逃がす。
-    レバ無しなので買付は現金の範囲のみ。約定待ちで売却額が現金へ反映されない
-    分は次サイクル(15分後)で買い増す。"""
-    print("=== ★退避★ 下落局面: 現金/SGOVへ ===")
-    use_stops = getattr(config, "USE_STOP_ORDERS", False)
-    for p in t.get_all_positions():
-        if p.symbol == safe:
-            continue
-        if use_stops:
-            cancel_stops(t, p.symbol)
-        o = MarketOrderRequest(symbol=p.symbol, qty=p.qty,
-                               side=OrderSide.SELL, time_in_force=TimeInForce.DAY)
-        try:
-            t.submit_order(o); print(f"  売却 {p.symbol} {p.qty}株")
-        except Exception as e:
-            print(f"  売り失敗 {p.symbol}: {e}")
-    acct = t.get_account()
-    spend = max(0.0, float(acct.cash) - float(acct.equity) * RESERVE)
-    if spend < 1:
-        print("  退避買付なし(現金不足/約定待ち。次サイクルで継続)。")
-        return
-    o = MarketOrderRequest(symbol=safe, notional=round(spend, 2),
-                           side=OrderSide.BUY, time_in_force=TimeInForce.DAY)
+# ===================== ポジションの手仕舞い =====================
+def close_symbol(t, sym, reason=""):
+    """sym の保護注文を取り消してから成行で全クローズ(ロング=売り/ショート=買い戻し)。"""
+    cancel_open_orders(t, sym)
     try:
-        t.submit_order(o); print(f"  {safe}: ${spend:,.0f} 退避買付")
+        t.close_position(sym)
+        print(f"  クローズ {sym} {reason}".rstrip())
     except Exception as e:
-        print(f"  {safe}: 失敗 {e}")
+        print(f"  クローズ失敗 {sym}: {e}")
 
 
-# ===================== 能動枠(#6 逆ボラ + #4 ストップ/ボラ連動幅) =====================
+def close_wrong_side(t, keep, safe):
+    """保ちたい方向(keep='long'/'short')と逆のポジション、および退避用SGOVを畳む。"""
+    for p in t.get_all_positions():
+        if p.symbol in config.CORE_SYMBOLS:
+            continue
+        q = float(p.qty)
+        wrong = (keep == "long" and q < 0) or (keep == "short" and q > 0)
+        if p.symbol == safe or wrong:
+            close_symbol(t, p.symbol, "(方向転換)")
+
+
+# ===================== ランキング(ロング候補 / ショート候補) =====================
 def rank_universe(dc):
+    """ユニバースを順位付け。
+    longs : 上昇トレンド(200日線超 & モメンタム+) を強い順
+    shorts: 下降トレンド(200日線割れ & モメンタム-) を弱い(最も下落)順
+    返り値: (longs, shorts, vol_map, price_map)。各候補は (sym, mom, price, vol)。
+    """
     md = config.MOMENTUM_DAYS
     vd = getattr(config, "VOL_DAYS", 20)
     df = all_bars(dc, config.UNIVERSE, 365)
-    scored = []
+    longs, shorts, vol_map, price_map = [], [], {}, {}
     for sym in config.UNIVERSE:
         try:
             c = df.loc[sym]["close"].reset_index(drop=True)
@@ -140,10 +125,15 @@ def rank_universe(dc):
         if not (vol > 0):
             vol = float(daily.std()) if len(daily) else 1e-6
             vol = vol if vol > 0 else 1e-6
+        vol_map[sym] = vol
+        price_map[sym] = price
         if price > sma200 and mom > 0:
-            scored.append((sym, mom, price, vol))
-    scored.sort(key=lambda x: x[1], reverse=True)
-    return scored
+            longs.append((sym, mom, price, vol))
+        elif price < sma200 and mom < 0:
+            shorts.append((sym, mom, price, vol))
+    longs.sort(key=lambda x: x[1], reverse=True)   # 強い順
+    shorts.sort(key=lambda x: x[1])                # 弱い(最も下落)順
+    return longs, shorts, vol_map, price_map
 
 
 def sleeve_weights(top):
@@ -159,87 +149,95 @@ def sleeve_weights(top):
     return {s: 1.0 / n for s in syms}
 
 
-def momentum(t, dc):
-    print("=== モメンタム・スキャン ===")
-    safe = getattr(config, "SAFE_SYMBOL", "SGOV")
-    use_stops = getattr(config, "USE_STOP_ORDERS", False)
+def trade_sleeve(t, direction, cands, vol_map, price_map):
+    """direction='long'/'short' の枠を「条件を満たした分だけ最大TOP_N銘柄」で運用。
+    - 目標から外れた同方向ポジションは入替で手仕舞い
+    - 継続保有はトレーリングストップで利を伸ばす(無ければ付け直す)
+    - 新規は均等配分で建て、必ずトレーリングストップを付ける
+    - レバ無し: 同方向の総建玉 <= 資産 * SLEEVE_PCT で打ち止め
+    """
+    is_long = direction == "long"
+    label = "ロング" if is_long else "ショート"
+    entry_side = OrderSide.BUY if is_long else OrderSide.SELL
+    stop_side = OrderSide.SELL if is_long else OrderSide.BUY
+    arrow = "買い" if is_long else "空売り"
+    print(f"=== モメンタム・スキャン({label}) ===")
+
     acct = t.get_account()
     equity = float(acct.equity)
-    cash_left = float(acct.cash) - equity * RESERVE
-    top_n = config.TOP_N
-    pos = {p.symbol: p for p in t.get_all_positions()
-           if p.symbol not in config.CORE_SYMBOLS and p.symbol != safe}
-    ranked = rank_universe(dc)
-    vol_map = {s: v for s, m, p, v in ranked}
-    top = ranked[:top_n]
-    targets = [s for s, m, p, v in top]
-    prices = {s: p for s, m, p, v in top}
-    top_vol = {s: v for s, m, p, v in top}
-    weights = sleeve_weights(top)
     sleeve_budget = equity * config.SLEEVE_PCT
+    max_n = config.TOP_N
+
+    top = cands[:max_n]
+    targets = [s for s, m, p, v in top]
+    weights = sleeve_weights(top)
     target_notional = {s: sleeve_budget * weights[s] for s in targets}
-    print(f"  重み付け: {getattr(config, 'WEIGHTING', 'equal')} / ストップ: "
-          f"{getattr(config, 'STOP_MODE', 'fixed')} / 注文化: {use_stops}")
-    print("  旬の上位:", ", ".join(f"{s}(+{m:.0f}%)" for s, m, p, v in top) or "該当なし")
-    if targets:
-        print("  配分目標:", ", ".join(f"{s} ${target_notional[s]:,.0f}" for s in targets))
 
-    # 入替/損切り(#4: 板のストップを取り消してから売る。閾値はボラ連動)
+    # 同方向の既存ポジション(コアは対象外)
+    pos = {}
+    for p in t.get_all_positions():
+        if p.symbol in config.CORE_SYMBOLS:
+            continue
+        q = float(p.qty)
+        if (is_long and q > 0) or (not is_long and q < 0):
+            pos[p.symbol] = p
+
+    try:
+        protected = {od.symbol for od in
+                     t.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN))}
+    except Exception:
+        protected = set()
+
+    print(f"  候補{len(cands)}件 / 最大{max_n}銘柄 / 重み:{getattr(config, 'WEIGHTING', 'equal')}")
+    print("  旬の上位: " + (", ".join(f"{s}({m:+.0f}%)" for s, m, p, v in top) or "該当なし"))
+
+    # 1) 目標から外れた同方向ポジションは入替で手仕舞い
+    for sym in list(pos.keys()):
+        if sym not in targets:
+            close_symbol(t, sym, "(入替)")
+            pos.pop(sym, None)
+
+    # 2) 継続保有に保護ストップが無ければ付け直す(建て直後の取りこぼし救済)
     for sym, p in pos.items():
-        gain = float(p.unrealized_plpc) * 100
-        thr = stop_pct(vol_map[sym]) if sym in vol_map else config.STOP_LOSS_PCT
-        if sym not in targets or gain <= -thr:
-            why = "損切り" if gain <= -thr else "入替売り"
-            if use_stops:
-                cancel_stops(t, sym)
-            o = MarketOrderRequest(symbol=sym, qty=p.qty, side=OrderSide.SELL,
-                                   time_in_force=TimeInForce.DAY)
-            try:
-                t.submit_order(o); print(f"  → {why} {sym} {p.qty}株 ({gain:+.1f}%, 損切り{thr:.0f}%)")
-                cash_left += float(p.market_value)
-            except Exception as e:
-                print(f"  売り失敗 {sym}: {e}")
+        if sym not in protected:
+            qty = abs(int(float(p.qty)))
+            if qty >= 1:
+                sp = stop_pct(vol_map.get(sym))
+                try:
+                    t.submit_order(TrailingStopOrderRequest(
+                        symbol=sym, qty=qty, side=stop_side,
+                        time_in_force=TimeInForce.GTC, trail_percent=round(sp, 2)))
+                    print(f"  ストップ補填 {sym} {qty}株 トレール{sp:.0f}%")
+                except Exception as e:
+                    print(f"  ストップ補填失敗 {sym}: {e}")
 
-    # 新規買い
+    # 3) 新規建て(レバ無し: 同方向の総建玉が枠を超えない範囲で)
+    deployed = sum(abs(float(p.market_value)) for p in pos.values())
     held = set(pos.keys())
     for sym in targets:
         if sym in held:
             continue
-        notional = target_notional[sym]
-        if notional < 1:
+        notional = target_notional.get(sym, 0.0)
+        price = price_map.get(sym, 0.0)
+        if notional < 1 or price <= 0:
             continue
-        sp = stop_pct(top_vol[sym])
-        if use_stops:
-            # #4: 整数株で買い、建値-損切り幅(ボラ連動)にGTCストップを板へ
-            price = prices[sym]
-            qty = int(notional // price)
-            if qty < 1:
-                print(f"  {sym}: 1株に満たず見送り(目標${notional:,.0f} < 株価${price:,.0f})")
-                continue
-            cost = qty * price
-            if cash_left < cost:
-                print(f"  {sym}: 現金不足のため見送り")
-                continue
-            try:
-                t.submit_order(MarketOrderRequest(symbol=sym, qty=qty, side=OrderSide.BUY,
-                                                  time_in_force=TimeInForce.DAY))
-                stop_px = round(price * (1 - sp / 100.0), 2)
-                t.submit_order(StopOrderRequest(symbol=sym, qty=qty, side=OrderSide.SELL,
-                                                time_in_force=TimeInForce.GTC, stop_price=stop_px))
-                print(f"  → 買い {sym} {qty}株 (${cost:,.0f}) + ストップ ${stop_px} (-{sp:.0f}%)")
-                cash_left -= cost
-            except Exception as e:
-                print(f"  買い失敗 {sym}: {e}")
-        else:
-            if cash_left < notional:
-                print(f"  {sym}: 現金不足のため見送り")
-                continue
-            try:
-                t.submit_order(MarketOrderRequest(symbol=sym, notional=round(notional, 2),
-                                                  side=OrderSide.BUY, time_in_force=TimeInForce.DAY))
-                print(f"  → 買い {sym} ${notional:,.0f}"); cash_left -= notional
-            except Exception as e:
-                print(f"  買い失敗 {sym}: {e}")
+        if deployed + notional > sleeve_budget + 1:
+            continue
+        qty = int(notional // price)
+        if qty < 1:
+            print(f"  {sym}: 1株に満たず見送り(目標${notional:,.0f} < 株価${price:,.0f})")
+            continue
+        sp = stop_pct(vol_map.get(sym))
+        try:
+            t.submit_order(MarketOrderRequest(symbol=sym, qty=qty, side=entry_side,
+                                              time_in_force=TimeInForce.DAY))
+            t.submit_order(TrailingStopOrderRequest(
+                symbol=sym, qty=qty, side=stop_side,
+                time_in_force=TimeInForce.GTC, trail_percent=round(sp, 2)))
+            print(f"  → {arrow} {sym} {qty}株 (${qty * price:,.0f}) + トレール{sp:.0f}%")
+            deployed += qty * price
+        except Exception as e:
+            print(f"  {label}建て失敗 {sym}: {e}")
 
 
 def run(t, dc):
@@ -247,14 +245,24 @@ def run(t, dc):
         print("市場は閉まっています。何もしません。")
         return
     safe = getattr(config, "SAFE_SYMBOL", "SGOV")
-    held = {p.symbol for p in t.get_all_positions()}
-    risk_on = market_risk_on(dc, safe in held)
+    positions = t.get_all_positions()
+    # 守りに入っているか(=ショート保有 or SGOV保有)でヒステリシス判定
+    defensive_now = (safe in {p.symbol for p in positions}) \
+        or any(float(p.qty) < 0 for p in positions)
+    risk_on = market_risk_on(dc, defensive_now)
+    longs, shorts, vol_map, price_map = rank_universe(dc)
+
     if risk_on:
-        print("リジーム: 通常(攻め=短期モメンタムをフル稼働)")
-        exit_safe(t, safe)      # 退避していたら解除して現金化
-        momentum(t, dc)         # 約97%でモメンタム運用
+        print("リジーム: 通常(攻め=強い銘柄をロング)")
+        close_wrong_side(t, "long", safe)          # ショート/退避を畳む
+        trade_sleeve(t, "long", longs, vol_map, price_map)
+    elif getattr(config, "ALLOW_SHORT", False) and shorts:
+        print("リジーム: ★下落★ 弱い銘柄をショート")
+        close_wrong_side(t, "short", safe)         # ロングを畳む
+        trade_sleeve(t, "short", shorts, vol_map, price_map)
     else:
-        retreat(t, safe)        # 全部売って現金(SGOV)へ退避
+        print("リジーム: ★下落★ ショート不可/候補なし → 現金で待機")
+        close_wrong_side(t, "short", safe)         # ロングを畳んで現金化
 
 
 def status(t):

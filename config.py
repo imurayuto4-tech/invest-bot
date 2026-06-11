@@ -9,10 +9,15 @@ PAPER = True
 CORE_SYMBOLS = []
 
 # --- 短期モメンタム枠(ほぼ全力) ---
-SLEEVE_PCT = 0.97         # 資産の約97%を投入(残り3%は現金=レバレッジ防止)
-TOP_N = 5
+SLEEVE_PCT = 0.97         # ロング/ショート合計で資産の約97%まで(残り3%現金=レバ防止)
+TOP_N = 10                # 「条件を満たした分だけ最大10銘柄」の可変式(少なければ自動で現金多め)
 MOMENTUM_DAYS = 20        # 短期化(60→20日モメンタム)。数日〜2週間のスイング
 STOP_LOSS_PCT = 8.0       # STOP_MODE="fixed" のときの一律損切り幅 / atrの保険値
+
+# --- ショート(空売り) ---
+# 通常はロングのみ。下落局面(SPYが200日線割れ)では現金退避の代わりに弱い銘柄を空売り。
+# レバ無し維持: 同方向の総建玉<=SLEEVE_PCT。出口はトレーリングストップ(安値から戻したら買戻し)。
+ALLOW_SHORT = True
 
 # --- リスク配分(均等=攻め型) ---
 WEIGHTING = "equal"       # 均等配分。動きの大きい銘柄にもしっかり乗る
@@ -25,26 +30,55 @@ REGIME_SMA = 200
 REGIME_BAND = 0.02
 SAFE_SYMBOL = "SGOV"
 
-# --- #4 本物の損切り注文 ---
-USE_STOP_ORDERS = True
-# 損切り幅: "fixed"=一律 STOP_LOSS_PCT% / "atr"=ボラ連動(STOP_K×日次ボラ%, MIN〜MAXで挟む)
+# --- ストップ(トレーリング: 利を伸ばし、ピークから戻したら自動決済) ---
+# トレール幅(%): "fixed"=一律 STOP_LOSS_PCT% / "atr"=ボラ連動(STOP_K×日次ボラ%, MIN〜MAXで挟む)
 STOP_MODE = "atr"
 STOP_K = 4.0
 STOP_MIN_PCT = 5.0
 STOP_MAX_PCT = 18.0
 
+# 流動性の高い米国上場株 約200銘柄(無料IEXデータで精度を保てる範囲)。
 UNIVERSE = [
-    "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA", "AMD",
-    "AVGO", "ORCL", "ADBE", "CRM", "INTC", "QCOM", "CSCO", "TXN",
-    "MU", "AMAT", "LRCX", "ADI", "INTU", "NOW", "PANW", "SNPS",
-    "CDNS", "KLAC", "MRVL", "ARM", "SMCI", "DELL",
-    "NFLX", "UBER", "SHOP", "PLTR", "SNOW", "CRWD", "DDOG", "NET",
-    "ABNB", "PYPL", "SQ", "COIN", "ROKU", "SPOT", "ZM",
-    "JPM", "BAC", "WFC", "GS", "MS", "C", "V", "MA", "AXP", "BLK", "SCHW",
-    "WMT", "COST", "HD", "LOW", "TGT", "MCD", "SBUX", "NKE", "LULU",
-    "DIS", "KO", "PEP", "PG", "CL", "MDLZ",
-    "JNJ", "UNH", "LLY", "PFE", "MRK", "ABBV", "TMO", "ABT", "DHR", "AMGN",
-    "XOM", "CVX", "COP", "SLB", "BA", "CAT", "GE", "HON", "DE",
-    "LMT", "RTX", "UPS", "FDX",
-    "T", "VZ", "CMCSA", "F", "GM", "DAL", "MMM",
+    # --- メガキャップ/テック ---
+    "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA", "AVGO", "ORCL", "ADBE", "CRM",
+    # --- 半導体 ---
+    "AMD", "INTC", "QCOM", "TXN", "MU", "AMAT", "LRCX", "ADI", "KLAC", "MRVL", "ARM",
+    "SMCI", "MCHP", "NXPI", "ON", "SWKS", "QRVO", "TER", "ASML", "TSM", "ANET", "GLW",
+    # --- ハードウェア/通信機器 ---
+    "DELL", "HPQ", "HPE", "NTAP", "STX", "WDC", "CSCO",
+    # --- ソフトウェア/ネット ---
+    "NOW", "PANW", "SNPS", "CDNS", "INTU", "NFLX", "UBER", "SHOP", "PLTR", "SNOW", "CRWD",
+    "DDOG", "NET", "ZS", "OKTA", "MDB", "TEAM", "WDAY", "HUBS", "TTD", "FTNT", "DOCU",
+    "TWLO", "GTLB", "PATH", "ROKU", "SPOT", "ZM", "SNAP", "PINS", "MTCH", "EA", "TTWO",
+    "RBLX", "U", "DASH", "ABNB",
+    # --- フィンテック/決済 ---
+    "PYPL", "SQ", "COIN", "AFRM", "HOOD", "SOFI", "V", "MA", "AXP",
+    # --- 中国/海外ADR ---
+    "BABA", "PDD", "JD", "SE", "MELI", "NU",
+    # --- 銀行/金融 ---
+    "JPM", "BAC", "WFC", "GS", "MS", "C", "BLK", "SCHW", "USB", "PNC", "TFC", "COF",
+    "DFS", "SYF", "ICE", "CME", "SPGI", "MCO", "MSCI", "MMC", "PGR", "TRV", "ALL", "CB",
+    "MET", "PRU", "AIG", "KKR", "BX", "APO",
+    # --- 消費(裁量) ---
+    "WMT", "COST", "HD", "LOW", "TGT", "MCD", "SBUX", "NKE", "LULU", "CMG", "ORLY", "AZO",
+    "ROST", "TJX", "DG", "DLTR", "YUM", "MAR", "HLT", "RCL", "CCL", "LVS", "WYNN", "MGM",
+    "DKNG", "ELF",
+    # --- 消費(生活必需品)/メディア ---
+    "DIS", "KO", "PEP", "PG", "CL", "MDLZ", "KMB", "GIS", "KHC", "MNST", "KDP", "STZ",
+    "CLX", "HSY",
+    # --- ヘルスケア ---
+    "JNJ", "UNH", "LLY", "PFE", "MRK", "ABBV", "TMO", "ABT", "DHR", "AMGN", "ISRG", "VRTX",
+    "REGN", "GILD", "BMY", "CVS", "CI", "ELV", "MCK", "ZTS", "BSX", "SYK", "MDT", "EW",
+    "IDXX", "DXCM", "MRNA", "BIIB", "HCA", "RMD", "BDX",
+    # --- 資本財/工業 ---
+    "BA", "CAT", "GE", "HON", "DE", "LMT", "RTX", "UPS", "FDX", "MMM", "EMR", "ETN", "PH",
+    "ITW", "GD", "NOC", "TDG", "CSX", "NSC", "UNP", "ODFL", "WM", "RSG", "PCAR", "CMI",
+    "ROK", "AME",
+    # --- エネルギー ---
+    "XOM", "CVX", "COP", "SLB", "EOG", "PSX", "MPC", "VLO", "OXY", "WMB", "KMI", "OKE",
+    "HAL", "DVN", "FANG",
+    # --- 素材 ---
+    "LIN", "APD", "SHW", "FCX", "NEM", "NUE", "DOW", "ECL",
+    # --- 通信/自動車 ---
+    "T", "VZ", "CMCSA", "F", "GM", "DAL",
 ]

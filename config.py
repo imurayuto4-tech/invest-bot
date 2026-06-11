@@ -52,12 +52,12 @@ UNIVERSE = [
     "TWLO", "GTLB", "PATH", "ROKU", "SPOT", "ZM", "SNAP", "PINS", "MTCH", "EA", "TTWO",
     "RBLX", "U", "DASH", "ABNB",
     # --- フィンテック/決済 ---
-    "PYPL", "SQ", "COIN", "AFRM", "HOOD", "SOFI", "V", "MA", "AXP",
+    "PYPL", "XYZ", "COIN", "AFRM", "HOOD", "SOFI", "V", "MA", "AXP",
     # --- 中国/海外ADR ---
     "BABA", "PDD", "JD", "SE", "MELI", "NU",
     # --- 銀行/金融 ---
     "JPM", "BAC", "WFC", "GS", "MS", "C", "BLK", "SCHW", "USB", "PNC", "TFC", "COF",
-    "DFS", "SYF", "ICE", "CME", "SPGI", "MCO", "MSCI", "MMC", "PGR", "TRV", "ALL", "CB",
+    "SYF", "ICE", "CME", "SPGI", "MCO", "MSCI", "MMC", "PGR", "TRV", "ALL", "CB",
     "MET", "PRU", "AIG", "KKR", "BX", "APO",
     # --- 消費(裁量) ---
     "WMT", "COST", "HD", "LOW", "TGT", "MCD", "SBUX", "NKE", "LULU", "CMG", "ORLY", "AZO",

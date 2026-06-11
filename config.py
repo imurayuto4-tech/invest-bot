@@ -4,17 +4,18 @@ API_KEY = os.environ.get("ALPACA_API_KEY", "")
 SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY", "")
 PAPER = True
 
-# --- 85%: インデックス・コア ---
-CORE_SYMBOLS = ["VOO", "VTI"]
+# --- 中長期コアは撤廃(短期特化) ---
+# 中長期の積み立ては別口で運用するため、このボットは短期モメンタムに全振り。
+CORE_SYMBOLS = []
 
-# --- 15%: モメンタム・スキャン(能動枠) ---
-SLEEVE_PCT = 0.15
+# --- 短期モメンタム枠(ほぼ全力) ---
+SLEEVE_PCT = 0.97         # 資産の約97%を投入(残り3%は現金=レバレッジ防止)
 TOP_N = 5
-MOMENTUM_DAYS = 60
+MOMENTUM_DAYS = 20        # 短期化(60→20日モメンタム)。数日〜2週間のスイング
 STOP_LOSS_PCT = 8.0       # STOP_MODE="fixed" のときの一律損切り幅 / atrの保険値
 
-# --- #6 リスク配分(逆ボラティリティ) ---
-WEIGHTING = "invvol"
+# --- リスク配分(均等=攻め型) ---
+WEIGHTING = "equal"       # 均等配分。動きの大きい銘柄にもしっかり乗る
 VOL_DAYS = 20
 
 # --- #8 暴落避難(リジーム・フィルター) ---

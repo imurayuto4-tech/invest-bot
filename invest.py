@@ -76,51 +76,47 @@ def market_risk_on(dc, hedged_now):
     return price >= sma * (1 - band)      # 退避は線-band%を割れたら
 
 
-# ===================== コア(#8対応:通常=指数 / 退避=SGOV) =====================
-def core(t, risk_on):
-    print("=== インデックス・コア ===")
-    safe = getattr(config, "SAFE_SYMBOL", "SGOV")
-    acct = t.get_account()
-    equity = float(acct.equity)
-    cash = float(acct.cash)
-    budget = equity * (1 - config.SLEEVE_PCT - RESERVE)
-    pos = {p.symbol: p for p in t.get_all_positions()}
-
-    if risk_on:
-        targets = list(config.CORE_SYMBOLS)
-        unwanted = [safe]
-        print("  リジーム: 通常(指数を保有)")
-    else:
-        targets = [safe]
-        unwanted = list(config.CORE_SYMBOLS)
-        print(f"  リジーム: ★退避★ コアを {safe} に避難")
-
-    for s in unwanted:
-        if s in pos and float(pos[s].market_value) > 1:
-            o = MarketOrderRequest(symbol=s, qty=pos[s].qty,
+# ===================== 退避(#8: 下落局面は現金/SGOVへ) =====================
+def exit_safe(t, safe):
+    """退避解除: 保有しているSGOVを売って、モメンタム買いの現金を作る。"""
+    for p in t.get_all_positions():
+        if p.symbol == safe and float(p.market_value) > 1:
+            o = MarketOrderRequest(symbol=safe, qty=p.qty,
                                    side=OrderSide.SELL, time_in_force=TimeInForce.DAY)
             try:
-                t.submit_order(o); print(f"  売却 {s} {pos[s].qty}株")
-                cash += float(pos[s].market_value)
+                t.submit_order(o); print(f"  退避解除: {safe} {p.qty}株 売却")
             except Exception as e:
-                print(f"  売り失敗 {s}: {e}")
+                print(f"  {safe} 売り失敗: {e}")
 
-    cur_val = sum(float(pos[s].market_value) for s in targets if s in pos)
-    deficit = budget - cur_val
-    spendable = max(0.0, cash - equity * RESERVE)
-    spend = min(deficit, spendable)
-    print(f"  目標${budget:,.0f} / 現在${cur_val:,.0f} / 現金${cash:,.0f}")
-    if spend < 1:
-        print("  買い増しなし(目標達成か現金不足)。")
-        return
-    per = spend / len(targets)
-    for s in targets:
-        o = MarketOrderRequest(symbol=s, notional=round(per, 2),
-                               side=OrderSide.BUY, time_in_force=TimeInForce.DAY)
+
+def retreat(t, safe):
+    """★退避★ モメンタム保有を全部売って現金(SGOV)へ逃がす。
+    レバ無しなので買付は現金の範囲のみ。約定待ちで売却額が現金へ反映されない
+    分は次サイクル(15分後)で買い増す。"""
+    print("=== ★退避★ 下落局面: 現金/SGOVへ ===")
+    use_stops = getattr(config, "USE_STOP_ORDERS", False)
+    for p in t.get_all_positions():
+        if p.symbol == safe:
+            continue
+        if use_stops:
+            cancel_stops(t, p.symbol)
+        o = MarketOrderRequest(symbol=p.symbol, qty=p.qty,
+                               side=OrderSide.SELL, time_in_force=TimeInForce.DAY)
         try:
-            t.submit_order(o); print(f"  {s}: ${per:,.0f} 買付")
+            t.submit_order(o); print(f"  売却 {p.symbol} {p.qty}株")
         except Exception as e:
-            print(f"  {s}: 失敗 {e}")
+            print(f"  売り失敗 {p.symbol}: {e}")
+    acct = t.get_account()
+    spend = max(0.0, float(acct.cash) - float(acct.equity) * RESERVE)
+    if spend < 1:
+        print("  退避買付なし(現金不足/約定待ち。次サイクルで継続)。")
+        return
+    o = MarketOrderRequest(symbol=safe, notional=round(spend, 2),
+                           side=OrderSide.BUY, time_in_force=TimeInForce.DAY)
+    try:
+        t.submit_order(o); print(f"  {safe}: ${spend:,.0f} 退避買付")
+    except Exception as e:
+        print(f"  {safe}: 失敗 {e}")
 
 
 # ===================== 能動枠(#6 逆ボラ + #4 ストップ/ボラ連動幅) =====================
@@ -253,8 +249,12 @@ def run(t, dc):
     safe = getattr(config, "SAFE_SYMBOL", "SGOV")
     held = {p.symbol for p in t.get_all_positions()}
     risk_on = market_risk_on(dc, safe in held)
-    core(t, risk_on)
-    momentum(t, dc)
+    if risk_on:
+        print("リジーム: 通常(攻め=短期モメンタムをフル稼働)")
+        exit_safe(t, safe)      # 退避していたら解除して現金化
+        momentum(t, dc)         # 約97%でモメンタム運用
+    else:
+        retreat(t, safe)        # 全部売って現金(SGOV)へ退避
 
 
 def status(t):

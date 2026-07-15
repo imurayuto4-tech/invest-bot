@@ -108,8 +108,9 @@ def rank_universe(dc):
     """
     md = config.MOMENTUM_DAYS
     vd = getattr(config, "VOL_DAYS", 20)
+    xs = getattr(config, "EXIT_SMA", 20)
     df = all_bars(dc, config.UNIVERSE, 365)
-    longs, shorts, vol_map, price_map = [], [], {}, {}
+    longs, shorts, vol_map, price_map, above_exit = [], [], {}, {}, {}
     for sym in config.UNIVERSE:
         try:
             c = df.loc[sym]["close"].reset_index(drop=True)
@@ -119,6 +120,7 @@ def rank_universe(dc):
             continue
         price = float(c.iloc[-1])
         sma200 = float(c.tail(200).mean())
+        sma_exit = float(c.tail(xs).mean())        # 個別トレンド割れ判定用の短期線
         mom = (price / float(c.iloc[-md]) - 1) * 100
         daily = c.pct_change().dropna()
         vol = float(daily.tail(vd).std())
@@ -127,13 +129,14 @@ def rank_universe(dc):
             vol = vol if vol > 0 else 1e-6
         vol_map[sym] = vol
         price_map[sym] = price
+        above_exit[sym] = price > sma_exit         # True=短期線の上(継続) / False=割れた(降りる)
         if price > sma200 and mom > 0:
             longs.append((sym, mom, price, vol))
         elif price < sma200 and mom < 0:
             shorts.append((sym, mom, price, vol))
     longs.sort(key=lambda x: x[1], reverse=True)   # 強い順
     shorts.sort(key=lambda x: x[1])                # 弱い(最も下落)順
-    return longs, shorts, vol_map, price_map
+    return longs, shorts, vol_map, price_map, above_exit
 
 
 def sleeve_weights(top):
@@ -149,11 +152,12 @@ def sleeve_weights(top):
     return {s: 1.0 / n for s in syms}
 
 
-def trade_sleeve(t, direction, cands, vol_map, price_map):
+def trade_sleeve(t, direction, cands, vol_map, price_map, above_exit):
     """direction='long'/'short' の枠を「条件を満たした分だけ最大TOP_N銘柄」で運用。
-    - 目標から外れた同方向ポジションは入替で手仕舞い
+    - 手仕舞いは (a)keep圏(top KEEP_N)から外れた or (b)個別トレンド割れ(EXIT_SMA線) の時だけ
+      → 単なるランク僅差では叩き売らず(ヒステリシス)、利はトレーリングストップに伸ばさせる
     - 継続保有はトレーリングストップで利を伸ばす(無ければ付け直す)
-    - 新規は均等配分で建て、必ずトレーリングストップを付ける
+    - 新規は均等配分で最大TOP_N銘柄まで建て、必ずトレーリングストップを付ける
     - レバ無し: 同方向の総建玉 <= 資産 * SLEEVE_PCT で打ち止め
     """
     is_long = direction == "long"
@@ -167,9 +171,11 @@ def trade_sleeve(t, direction, cands, vol_map, price_map):
     equity = float(acct.equity)
     sleeve_budget = equity * config.SLEEVE_PCT
     max_n = config.TOP_N
+    keep_n = max(getattr(config, "KEEP_N", max_n), max_n)   # 保有を許すランク圏(>=TOP_N)
 
     top = cands[:max_n]
-    targets = [s for s, m, p, v in top]
+    targets = [s for s, m, p, v in top]                     # 新規建ての目標(top TOP_N)
+    keep_set = {s for s, m, p, v in cands[:keep_n]}         # 保有継続を許す圏(top KEEP_N)
     weights = sleeve_weights(top)
     target_notional = {s: sleeve_budget * weights[s] for s in targets}
 
@@ -191,10 +197,16 @@ def trade_sleeve(t, direction, cands, vol_map, price_map):
     print(f"  候補{len(cands)}件 / 最大{max_n}銘柄 / 重み:{getattr(config, 'WEIGHTING', 'equal')}")
     print("  旬の上位: " + (", ".join(f"{s}({m:+.0f}%)" for s, m, p, v in top) or "該当なし"))
 
-    # 1) 目標から外れた同方向ポジションは入替で手仕舞い
+    # 1) 手仕舞い判定(ヒステリシス): keep圏から外れた or 自分の短期線(EXIT_SMA)を割った時だけ。
+    #    ランク僅差(#10⇔#11)では売らず、利はトレーリングストップに伸ばさせる。
     for sym in list(pos.keys()):
-        if sym not in targets:
-            close_symbol(t, sym, "(入替)")
+        if sym not in keep_set:
+            close_symbol(t, sym, "(入替: keep圏外)")
+            pos.pop(sym, None)
+            continue
+        ae = above_exit.get(sym)                # None=データ欠損時は判定せず保持(グリッチ耐性)
+        if ae is not None and ((is_long and not ae) or (not is_long and ae)):
+            close_symbol(t, sym, "(トレンド割れ)")
             pos.pop(sym, None)
 
     # 2) 継続保有に保護ストップが無ければ付け直す(建て直後の取りこぼし救済)
@@ -250,16 +262,16 @@ def run(t, dc):
     defensive_now = (safe in {p.symbol for p in positions}) \
         or any(float(p.qty) < 0 for p in positions)
     risk_on = market_risk_on(dc, defensive_now)
-    longs, shorts, vol_map, price_map = rank_universe(dc)
+    longs, shorts, vol_map, price_map, above_exit = rank_universe(dc)
 
     if risk_on:
         print("リジーム: 通常(攻め=強い銘柄をロング)")
         close_wrong_side(t, "long", safe)          # ショート/退避を畳む
-        trade_sleeve(t, "long", longs, vol_map, price_map)
+        trade_sleeve(t, "long", longs, vol_map, price_map, above_exit)
     elif getattr(config, "ALLOW_SHORT", False) and shorts:
         print("リジーム: ★下落★ 弱い銘柄をショート")
         close_wrong_side(t, "short", safe)         # ロングを畳む
-        trade_sleeve(t, "short", shorts, vol_map, price_map)
+        trade_sleeve(t, "short", shorts, vol_map, price_map, above_exit)
     else:
         print("リジーム: ★下落★ ショート不可/候補なし → 現金で待機")
         close_wrong_side(t, "short", safe)         # ロングを畳んで現金化
